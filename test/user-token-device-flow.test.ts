@@ -194,6 +194,8 @@ describe('user authorization device flow', () => {
       advance(5);
       expect(await grant.poll()).toEqual({ status: 'ready', token: TOKEN });
       expect(JSON.parse(readFileSync(tokenPath(), 'utf8')).onDemandScopes).toEqual(['im:resource']);
+      const { resolveUserTokenWithScopes } = await import('../src/utils/user-token.js');
+      expect(await resolveUserTokenWithScopes(APP, 'secret', 'feishu', USER)).toMatchObject({ onDemandScopes: ['im:resource'] });
       const later = await requestUserAuthorization(APP, 'secret', 'feishu', ['docx:document:readonly'], USER, () => current);
       expect(later.scopes).toContain('im:resource');
     });

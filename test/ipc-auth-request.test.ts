@@ -51,6 +51,7 @@ beforeEach(async () => {
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 });
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue(undefined);
+  vi.spyOn(tokens, 'resolveUserTokenWithScopes').mockResolvedValue(null);
   poll = vi.fn().mockResolvedValue({ status: 'pending' });
   vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
     authUrl: AUTH_URL, scopes: ['offline_access', 'im:chat:read'], expiresIn: 600, poll,
@@ -79,6 +80,105 @@ function post(action = 'auth-request', overrides: Record<string, unknown> = {}, 
     body: JSON.stringify({ scopes: ['im:chat:read'], originCapability: CAP, originTurnId: 'om_turn', ...overrides }),
   });
 }
+
+describe('reuse an existing authorization', () => {
+  function sufficientToken() {
+    return { accessToken: 'existing-user-token', scopes: ['im:message:readonly', 'offline_access', 'im:chat:read'] };
+  }
+
+  it.each(['p2p', 'group'])('reuses granted scopes without issuing or delivering a link in %s', async chatType => {
+    session.chatType = chatType;
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue(sufficientToken());
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('unused');
+    const response = await post();
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: true, status: 'ready', reused: true });
+    expect(JSON.stringify(body)).not.toContain('existing-user-token');
+    expect(tokens.resolveUserTokenWithScopes).toHaveBeenCalledWith('cli_test', 'test-secret', 'feishu', 'ou_sender', expect.any(AbortSignal));
+    expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', expect.objectContaining({
+      openId: 'ou_sender', turnId: 'om_turn', userAccessToken: 'existing-user-token',
+    }), expect.any(String));
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+    expect(dm).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, ['im:message:readonly', 'offline_access']])('still requests genuinely missing or unknown scopes: %j', async scopes => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue({ accessToken: 'existing', scopes });
+    expect((await (await post()).json()).requestId).toBeTypeOf('string');
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('only reuses on-demand scopes with explicit consent (marked=%s)', async marked => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue({
+      ...sufficientToken(), scopes: [...sufficientToken().scopes, 'im:resource'],
+      ...(marked ? { onDemandScopes: ['im:resource'] } : {}),
+    });
+    const body = await (await post('auth-request', { scopes: ['im:resource'] })).json();
+    if (marked) {
+      expect(body).toMatchObject({ status: 'ready', reused: true });
+      expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+    } else {
+      expect(body.requestId).toBeTypeOf('string');
+      expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('preserves default login scopes when no explicit scopes were supplied', async () => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue({ accessToken: 'existing', scopes: ['im:chat:read'] });
+    expect((await (await post('auth-request', { scopes: [] })).json()).requestId).toBeTypeOf('string');
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])('does not issue a fresh grant if publishing existing credentials is not ready (material=%s)', async present => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue(sufficientToken());
+    vi.mocked(cliIdentity.refreshSessionIdentity).mockReturnValue(false);
+    vi.mocked(cliIdentity.sessionIdentityMaterialPresent).mockReturnValue(present);
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: present ? 'auth_identity_publish_pending' : 'auth_identity_snapshot_missing' });
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the speaker changes while resolving the token', async () => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockImplementation(async () => {
+      session.managedTurnOrigin.callerOpenId = 'ou_other';
+      return sufficientToken();
+    });
+    expect((await post()).status).toBe(403);
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('refuses a policy change during token resolution', async () => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockImplementation(async () => {
+      vi.mocked(botRegistry.getBot).mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'changed-secret' } } as any);
+      return sufficientToken();
+    });
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'auth_policy_changed' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('refuses a conflicting legacy identity model without issuing consent', async () => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue(sufficientToken());
+    vi.spyOn(workerPool, 'identityDecisionConflict').mockReturnValue(true);
+    const response = await post();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'auth_identity_decision_conflict' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('does not turn a token lookup error into another consent request', async () => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockRejectedValue(new Error('timeout'));
+    const response = await post();
+    expect(response.status).toBe(503);
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+  });
+});
 
 describe('agent authorization in a group chat', () => {
   beforeEach(() => { session.chatType = 'group'; });

@@ -8,6 +8,7 @@ import * as workerPool from '../src/core/worker-pool.js';
 import * as bots from '../src/bot-registry.js';
 import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
+import * as cliIdentity from '../src/core/cli-identity.js';
 import * as larkClient from '../src/im/lark/client.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import * as bytedcliAuth from '../src/services/bytedcli-auth.js';
@@ -58,6 +59,7 @@ beforeEach(async () => {
   vi.spyOn(bots, 'getBotClient').mockReturnValue({ tokenManager: { getTenantAccessToken: botToken } } as unknown as Client);
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue({ openId: 'ou_sender', type: 'user' } as any);
   vi.spyOn(tokens, 'resolveUserToken').mockResolvedValue('bound-user-token');
+  vi.spyOn(tokens, 'resolveUserTokenWithScopes').mockResolvedValue(null);
   setIpcAuthSecret('host-test-key');
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
@@ -85,6 +87,57 @@ function useRunAsTurn(allowedUsers: string[]) {
   vi.spyOn(larkClient, 'resolveUnionIdFromOpenId').mockResolvedValue('on_sender');
   return botConfig;
 }
+describe('bound tool authorization reuse', () => {
+  const ask = (scopes = ['im:chat:read']) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+    body: JSON.stringify({ scopes }),
+  });
+  const snapshot = () => ({ accessToken: 'reused-bound-token', scopes: [...tokens.DEFAULT_USER_AUTH_SCOPES, 'im:chat:read'] });
+  beforeEach(() => {
+    vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender' } as any);
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockResolvedValue(snapshot());
+    vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/new-grant',
+      scopes: ['sheets:spreadsheet:read'], expiresIn: 300, poll: vi.fn().mockResolvedValue({ status: 'pending' }) });
+    vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    vi.spyOn(cliIdentity, 'refreshSessionIdentity').mockReturnValue(true);
+  });
+  it('returns ready for existing scopes without issuing or delivering a grant or publishing legacy identity', async () => {
+    session.chatType = 'group';
+    const response = await ask();
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: true, status: 'ready', reused: true });
+    expect(JSON.stringify(body)).not.toContain('reused-bound-token');
+    expect(tokens.resolveUserTokenWithScopes).toHaveBeenCalledExactlyOnceWith(
+      'cli_bound', 'bound-secret', 'feishu', 'ou_sender', expect.any(AbortSignal));
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+    expect(larkClient.sendUserMessage).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+  it.each(['user', 'policy'] as const)('refuses a %s change during the token lookup', async change => {
+    vi.mocked(tokens.resolveUserTokenWithScopes).mockImplementation(async () => {
+      if (change === 'user') session.managedTurnOrigin.callerOpenId = 'ou_other';
+      else bots.getBot('cli_bound').config.triggerUserAuth = { enabled: true, tools: ['lark-cli'] } as any;
+      return snapshot();
+    });
+    const response = await ask();
+    expect(response.status).toBe(change === 'user' ? 403 : 409);
+    expect(await response.json()).toMatchObject({ ok: false,
+      error: change === 'user' ? 'current_actor_unverified' : 'auth_policy_changed' });
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+    expect(larkClient.sendUserMessage).not.toHaveBeenCalled();
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+  it('still requests authorization when an additional scope is missing', async () => {
+    const response = await ask(['sheets:spreadsheet:read']);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, authUrl: 'https://example.com/new-grant', requestId: expect.any(String) });
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledExactlyOnceWith('cli_bound', 'bound-secret', 'feishu',
+      ['sheets:spreadsheet:read'], 'ou_sender', expect.any(Function));
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
+  });
+});
+
 describe('session application identity route', () => {
   it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
     const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {

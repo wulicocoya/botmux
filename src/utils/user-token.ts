@@ -653,6 +653,8 @@ export interface UserTokenSnapshot {
   accessToken: string;
   /** 与 accessToken 来自同一次 TokenStore 加载/刷新；旧 token 没记 scope 时为 undefined。 */
   scopes?: string[];
+  /** Explicitly consented on-demand scopes from the same token snapshot. */
+  onDemandScopes?: string[];
 }
 
 /**
@@ -669,7 +671,8 @@ export async function resolveUserTokenWithScopes(
   const resolved = await resolveTokenStoreFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
   if (!resolved) return null;
   const scopes = splitScopes(resolved.scope);
-  return { accessToken: resolved.access_token, ...(scopes.length > 0 ? { scopes } : {}) };
+  return { accessToken: resolved.access_token, ...(scopes.length > 0 ? { scopes } : {}),
+    ...(resolved.onDemandScopes?.length ? { onDemandScopes: resolved.onDemandScopes } : {}) };
 }
 
 /**
@@ -705,10 +708,10 @@ const DEFAULT_PORT = 9768;
  * 授权时必须同时带上旧 token 的 scope（按需权限只带本人显式授权过的，见 ON_DEMAND_USER_SCOPES），
  * 否则飞书返回的新 token 会覆盖旧 token，把本次未显式请求的既有能力静默降权。
  */
-const DEFAULT_SCOPES = [
+export const DEFAULT_USER_AUTH_SCOPES: readonly string[] = [
   'im:message:readonly',
   'offline_access',
-].join(' ');
+];
 
 export { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES };
 
@@ -739,7 +742,7 @@ function authorizationScopes(
 ): string[] {
   const existing = loadTokenForApp(appId, brand, openId);
   return [...new Set([
-    ...DEFAULT_SCOPES.split(' '),
+    ...DEFAULT_USER_AUTH_SCOPES,
     ...extraScopes,
     // 按需权限只延续本人显式授权过的（onDemandScopes），默认集带来的不再连带申请。
     ...splitScopes(existing?.token.scope).filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope)
@@ -907,7 +910,7 @@ export async function requestUserAuthorization(
 
 /**
  * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
- * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login 都会请求这些 scope，
+ * DEFAULT_USER_AUTH_SCOPES —— 否则所有 bot 的通用 /login 都会请求这些 scope，
  * 没在开发者后台启用它们的 app 会一起 20043 失败。改由 /subscribe-lark-doc 在
  * 需要时通过 generateAuthUrl 的 extraScopes 单独带上。
  *
@@ -925,7 +928,7 @@ export const DOC_COMMENT_OAUTH_SCOPES = [
 /**
  * 会话群标签（p2pMode=group + feedGroup）专用的额外 OAuth scope。飞书「消息分组」
  * 是用户个人侧边栏数据，只认 user_access_token —— 与 DOC_COMMENT_OAUTH_SCOPES
- * 同理**不进**通用 /login 的 DEFAULT_SCOPES。使用前需在开发者后台为该 app 启用
+ * 同理**不进**通用 /login 的 DEFAULT_USER_AUTH_SCOPES。使用前需在开发者后台为该 app 启用
  * 这两个用户 scope（见 setup/lark-scopes.json）。
  */
 export const FEED_GROUP_OAUTH_SCOPES = [
@@ -969,7 +972,7 @@ export function generateAuthUrl(
   // 一起申请，否则新 token 覆盖同一用户的旧文件时会造成静默降权。
   const scopes = isUsableOpenId(openId)
     ? authorizationScopes(appId, brand, extraScopes, openId)
-    : [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+    : [...new Set([...DEFAULT_USER_AUTH_SCOPES, ...extraScopes])];
   const scope = scopes.join(' ');
   const params = new URLSearchParams({
     client_id: appId,

@@ -632,7 +632,7 @@ import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
-import { resolveUserToken } from '../utils/user-token.js';
+import { resolveUserToken, resolveUserTokenWithScopes, DEFAULT_USER_AUTH_SCOPES, ON_DEMAND_USER_SCOPES } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
 import { capabilityOfTool } from './identity-policy.js';
 import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js';
@@ -5199,6 +5199,48 @@ for (const action of ['auth-request', 'auth-status']) {
     }
     // The check above awaited; the turn may have moved on meanwhile.
     if (!isCurrent()) return denyCurrentActor('origin_changed_during_platform_lookup');
+    // A repeated request is not a request to log out and authorize again.
+    // Resolve token and scopes together (including automatic refresh), strictly
+    // for the verified app/user and only after the platform-source decision.
+    const reusePolicy = JSON.stringify(cfg.triggerUserAuth);
+    const reuseSecret = cfg.larkAppSecret;
+    const reuseBrand = normalizeBrand(cfg.brand);
+    let existing;
+    try {
+      existing = await resolveUserTokenWithScopes(
+        cfg.larkAppId, reuseSecret, reuseBrand, callerOpenId, AbortSignal.timeout(8_000),
+      );
+    } catch {
+      return jsonRes(res, 503, { ok: false, error: 'authorization_lookup_failed' });
+    }
+    if (!isCurrent()) return denyCurrentActor('origin_changed_during_token_lookup');
+    const currentAuthConfig = getBot(ds.larkAppId).config;
+    if (currentAuthConfig.larkAppSecret !== reuseSecret
+      || normalizeBrand(currentAuthConfig.brand) !== reuseBrand
+      || JSON.stringify(currentAuthConfig.triggerUserAuth) !== reusePolicy) {
+      return jsonRes(res, 409, { ok: false, error: 'auth_policy_changed' });
+    }
+    const requiredScopes = [...new Set([...DEFAULT_USER_AUTH_SCOPES, ...scopes])];
+    if (existing?.scopes && requiredScopes.every(scope => existing.scopes!.includes(scope)
+      && (!ON_DEMAND_USER_SCOPES.includes(scope) || existing.onDemandScopes?.includes(scope)))) {
+      if (!boundTool) {
+        if (identityDecisionConflict(ds)) {
+          return jsonRes(res, 409, { ok: false, error: 'auth_identity_decision_conflict' });
+        }
+        const storageModel = identityStorageModelForDaemonSession(ds);
+        if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+          tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: existing.accessToken,
+          turnId: identityTurnId, openId: callerOpenId,
+        }, storageModel)) {
+          const materialPresent = sessionIdentityMaterialPresent(
+            config.session.dataDir, params.sessionId, 'lark-cli', identityTurnId, storageModel,
+          );
+          return jsonRes(res, 409, { ok: false,
+            error: materialPresent ? 'auth_identity_publish_pending' : 'auth_identity_snapshot_missing' });
+        }
+      }
+      return jsonRes(res, 200, { ok: true, status: 'ready', reused: true, scopes: requiredScopes });
+    }
     // Issuance is turn-bound; an accepted grant belongs to this app/user and
     // session until its own deadline. A different speaker cannot claim it.
     const appId = cfg.larkAppId;
