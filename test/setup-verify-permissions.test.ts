@@ -507,6 +507,39 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(declared.has('im:feed_group_v1:write')).toBe(true);
   });
 
+  it('manifest excludes unused or redundant review-triggering scopes', async () => {
+    // 2026-11: 飞书版本里只要有一项命中人工审核，整版都会挂起且不点名。
+    // 这三项是早期从完整 wiki 权限包带入的；防止以后再次整份粘贴回来。
+    // - comment:update/delete：lark-cli 的更新回复、删除回复、解决评论接口也接受
+    //   清单继续保留的 docs:document.comment:write_only，能力不依赖这两个细粒度项。
+    // - docx:block:convert：运行时、内置 skill 和文档写文档流程均无转换 API 调用；
+    //   当前文档创建/更新走 docs_ai，原生 Docx 写入由 docx:document:write_only 覆盖。
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const removed = [
+      'docs:document.comment:delete',
+      'docs:document.comment:update',
+      'docx:document.block:convert',
+    ];
+    expect(removed.filter(name => declared.has(name))).toEqual([]);
+
+    // 阴性对照 + 保留项：别让读空清单或误删实际功能也让上面的断言通过。
+    for (const retained of [
+      'contact:contact.base:readonly',
+      'docs:document.comment:create',
+      'docs:document.comment:write_only',
+      'docx:document:write_only',
+      'im:message',
+    ]) {
+      expect(declared.has(retained), `应保留实际仍在使用的权限 ${retained}`).toBe(true);
+    }
+  });
+
   it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
     expect([...VC_MEETING_BOT_EVENTS]).toEqual([
       'vc.bot.meeting_invited_v1',
